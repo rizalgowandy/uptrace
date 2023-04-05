@@ -11,10 +11,9 @@ import (
 	"github.com/uptrace/go-clickhouse/ch/bfloat16"
 	"github.com/uptrace/opentelemetry-go-extra/otelzap"
 	"github.com/uptrace/uptrace/pkg/bunapp"
-	"github.com/uptrace/uptrace/pkg/bunconf"
 	"github.com/uptrace/uptrace/pkg/bunotel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric/instrument"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 	"go4.org/syncutil"
 	"golang.org/x/exp/slices"
@@ -49,7 +48,7 @@ func NewMeasureProcessor(app *bunapp.App) *MeasureProcessor {
 		ch:   make(chan *Measure, conf.Metrics.BufferSize),
 		gate: syncutil.NewGate(maxprocs),
 
-		c2d:    NewCumToDeltaConv(bunconf.ScaleWithCPU(4000, 32000)),
+		c2d:    NewCumToDeltaConv(conf.Metrics.CumToDeltaSize),
 		logger: app.Logger,
 
 		metricMap:  make(map[MetricKey]struct{}),
@@ -63,7 +62,8 @@ func NewMeasureProcessor(app *bunapp.App) *MeasureProcessor {
 	p.logger.Info("starting processing metrics...",
 		zap.Int("threads", maxprocs),
 		zap.Int("batch_size", p.batchSize),
-		zap.Int("buffer_size", conf.Metrics.BufferSize))
+		zap.Int("buffer_size", conf.Metrics.BufferSize),
+		zap.Int("cum_to_delta_size", conf.Metrics.CumToDeltaSize))
 
 	app.WaitGroup().Add(1)
 	go func() {
@@ -72,15 +72,14 @@ func NewMeasureProcessor(app *bunapp.App) *MeasureProcessor {
 		p.processLoop(app.Context())
 	}()
 
-	bufferSize, _ := bunotel.Meter.AsyncInt64().Gauge("uptrace.measures.buffer_size")
+	bufferSize, _ := bunotel.Meter.Int64ObservableGauge("uptrace.measures.buffer_size")
 
-	if err := bunotel.Meter.RegisterCallback(
-		[]instrument.Asynchronous{
-			bufferSize,
+	if _, err := bunotel.Meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			o.ObserveInt64(bufferSize, int64(len(p.ch)))
+			return nil
 		},
-		func(ctx context.Context) {
-			bufferSize.Observe(ctx, int64(len(p.ch)))
-		},
+		bufferSize,
 	); err != nil {
 		panic(err)
 	}
@@ -132,8 +131,10 @@ loop:
 			if len(measures) < p.batchSize {
 				break
 			}
+
 			p.flushMeasures(ctx, measures)
-			measures = make([]*Measure, 0, len(measures))
+			measures = measures[:0]
+
 			if !timer.Stop() {
 				<-timer.C
 			}
@@ -281,16 +282,23 @@ func (p *MeasureProcessor) convertExpHistogramPoint(
 	return true
 }
 
-func (p *MeasureProcessor) flushMeasures(ctx context.Context, measures []*Measure) {
+func (p *MeasureProcessor) flushMeasures(ctx context.Context, src []*Measure) {
 	ctx, span := bunotel.Tracer.Start(ctx, "flush-measures")
 
 	p.WaitGroup().Add(1)
 	p.gate.Start()
 
+	measures := make([]*Measure, len(src))
+	copy(measures, src)
+
 	go func() {
 		defer span.End()
 		defer p.gate.Done()
 		defer p.WaitGroup().Done()
+
+		for _, measure := range measures {
+			measure.Time = measure.Time.Truncate(time.Minute)
+		}
 
 		if err := InsertMeasures(ctx, p.App, measures); err != nil {
 			p.Zap(ctx).Error("InsertMeasures failed", zap.Error(err))
@@ -321,10 +329,9 @@ func (p *MeasureProcessor) initMeasure(ctx *measureContext, measure *Measure) {
 		digest.WriteString(value)
 	}
 
-	measure.Time = measure.Time.Truncate(time.Minute)
 	measure.AttrsHash = digest.Sum64()
-	measure.AttrKeys = keys
-	measure.AttrValues = values
+	measure.StringKeys = keys
+	measure.StringValues = values
 }
 
 type MetricKey struct {
@@ -366,7 +373,7 @@ func (p *MeasureProcessor) upsertMetric(ctx context.Context, measure *Measure) {
 		return
 	}
 	if inserted {
-		p.dashSyncer.Sync(ctx, metric.ProjectID)
+		p.dashSyncer.CreateDashboards(ctx, metric.ProjectID)
 	}
 }
 

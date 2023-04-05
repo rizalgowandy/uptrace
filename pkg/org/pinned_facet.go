@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	"github.com/uptrace/bun"
+	"github.com/uptrace/uptrace/pkg/attrkey"
 	"github.com/uptrace/uptrace/pkg/bunapp"
-	"github.com/uptrace/uptrace/pkg/tracing/attrkey"
 	"golang.org/x/exp/slices"
 )
 
@@ -55,7 +55,7 @@ type PinnedFacet struct {
 func SelectPinnedFacets(ctx context.Context, app *bunapp.App, userID uint64) ([]string, error) {
 	var facets []*PinnedFacet
 
-	if err := app.DB.NewSelect().
+	if err := app.PG.NewSelect().
 		Model(&facets).
 		Where("user_id = ?", userID).
 		Scan(ctx); err != nil {

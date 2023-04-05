@@ -18,7 +18,7 @@ const (
 	jsonContentType      = "application/json"
 )
 
-var spanCounter, _ = bunotel.Meter.SyncInt64().Counter(
+var spanCounter, _ = bunotel.Meter.Int64Counter(
 	"uptrace.projects.spans",
 	instrument.WithDescription("Number of processed spans"),
 )
@@ -44,8 +44,6 @@ func initOTLP(ctx context.Context, app *bunapp.App, sp *SpanProcessor) {
 
 func initRoutes(ctx context.Context, app *bunapp.App, sp *SpanProcessor) {
 	router := app.Router()
-	spanHandler := NewSpanHandler(app)
-	traceHandler := NewTraceHandler(app)
 	middleware := org.NewMiddleware(app)
 
 	api := app.APIGroup()
@@ -57,6 +55,13 @@ func initRoutes(ctx context.Context, app *bunapp.App, sp *SpanProcessor) {
 		g.POST("/spans", zipkinHandler.PostSpans)
 	})
 
+	router.WithGroup("/api", func(g *bunrouter.Group) {
+		sentryHandler := NewSentryHandler(app, sp)
+
+		g.POST("/:project_id/store/", sentryHandler.Store)
+		g.POST("/:project_id/envelope/", sentryHandler.Envelope)
+	})
+
 	router.WithGroup("/api/v1", func(g *bunrouter.Group) {
 		vectorHandler := NewVectorHandler(app, sp)
 
@@ -64,23 +69,12 @@ func initRoutes(ctx context.Context, app *bunapp.App, sp *SpanProcessor) {
 		g.POST("/vector/logs", vectorHandler.Create)
 	})
 
-	api.GET("/traces/search", traceHandler.FindTrace)
-
-	g := api.
-		Use(middleware.UserAndProject).
-		NewGroup("/tracing/:project_id")
-
 	api.
 		Use(middleware.UserAndProject).
 		WithGroup("/tracing/:project_id", func(g *bunrouter.Group) {
 			sysHandler := NewSystemHandler(app)
 
-			g.GET("/envs", sysHandler.ListEnvs)
-			g.GET("/services", sysHandler.ListServices)
-
 			g.GET("/systems", sysHandler.ListSystems)
-			g.GET("/systems-stats", sysHandler.ListSystemStats)
-			g.GET("/overview", sysHandler.Overview)
 		})
 
 	api.
@@ -105,11 +99,27 @@ func initRoutes(ctx context.Context, app *bunapp.App, sp *SpanProcessor) {
 			g.PUT("/:view_id/unpinned", viewHandler.Unpin)
 		})
 
-	g.GET("/groups", spanHandler.ListGroups)
-	g.GET("/spans", spanHandler.ListSpans)
-	g.GET("/percentiles", spanHandler.Percentiles)
-	g.GET("/stats", spanHandler.Stats)
+	api.
+		Use(middleware.UserAndProject).
+		WithGroup("/tracing/:project_id", func(g *bunrouter.Group) {
+			spanHandler := NewSpanHandler(app)
 
-	g.GET("/traces/:trace_id", traceHandler.ShowTrace)
-	g.GET("/traces/:trace_id/:span_id", traceHandler.ShowSpan)
+			g.GET("/groups", spanHandler.ListGroups)
+			g.GET("/spans", spanHandler.ListSpans)
+			g.GET("/percentiles", spanHandler.Percentiles)
+			g.GET("/group-stats", spanHandler.GroupStats)
+		})
+
+	api.
+		Use(middleware.User).
+		WithGroup("", func(g *bunrouter.Group) {
+			traceHandler := NewTraceHandler(app)
+
+			g.GET("/traces/search", traceHandler.FindTrace)
+
+			g = g.Use(middleware.UserAndProject).NewGroup("/tracing/:project_id")
+
+			g.GET("/traces/:trace_id", traceHandler.ShowTrace)
+			g.GET("/traces/:trace_id/:span_id", traceHandler.ShowSpan)
+		})
 }

@@ -9,15 +9,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gogo/protobuf/jsonpb"
 	"github.com/uptrace/bunrouter"
 	"github.com/uptrace/go-clickhouse/ch/bfloat16"
+	"github.com/uptrace/uptrace/pkg/attrkey"
 	"github.com/uptrace/uptrace/pkg/bunapp"
-	"github.com/uptrace/uptrace/pkg/bunconf"
 	"github.com/uptrace/uptrace/pkg/bununit"
 	"github.com/uptrace/uptrace/pkg/org"
 	"github.com/uptrace/uptrace/pkg/otlpconv"
-	"github.com/uptrace/uptrace/pkg/tracing/attrkey"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	collectormetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -27,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -67,9 +66,13 @@ func (s *MetricsServiceServer) ExportHTTP(w http.ResponseWriter, req bunrouter.R
 
 	switch contentType := req.Header.Get("content-type"); contentType {
 	case jsonContentType:
-		metricsReq := new(collectormetricspb.ExportMetricsServiceRequest)
+		body, err := ioutil.ReadAll(req.Body)
+		if err != nil {
+			return err
+		}
 
-		if err := jsonpb.Unmarshal(req.Body, metricsReq); err != nil {
+		metricsReq := new(collectormetricspb.ExportMetricsServiceRequest)
+		if err := protojson.Unmarshal(body, metricsReq); err != nil {
 			return err
 		}
 
@@ -78,8 +81,17 @@ func (s *MetricsServiceServer) ExportHTTP(w http.ResponseWriter, req bunrouter.R
 			return err
 		}
 
-		return jsonMarshaler.Marshal(w, resp)
-	case protobufContentType:
+		b, err := protojson.Marshal(resp)
+		if err != nil {
+			return err
+		}
+
+		if _, err := w.Write(b); err != nil {
+			return err
+		}
+
+		return nil
+	case xprotobufContentType, protobufContentType:
 		body, err := ioutil.ReadAll(req.Body)
 		if err != nil {
 			return err
@@ -145,7 +157,7 @@ func (s *MetricsServiceServer) Export(
 func (s *MetricsServiceServer) export(
 	ctx context.Context,
 	req *collectormetricspb.ExportMetricsServiceRequest,
-	project *bunconf.Project,
+	project *org.Project,
 ) (*collectormetricspb.ExportMetricsServiceResponse, error) {
 	p := otlpProcessor{
 		App: s.App,
@@ -196,7 +208,7 @@ type otlpProcessor struct {
 	mp *MeasureProcessor
 
 	ctx      context.Context
-	project  *bunconf.Project
+	project  *org.Project
 	resource AttrMap
 
 	metricIDMap map[MetricKey]struct{}
@@ -212,7 +224,7 @@ func (p *otlpProcessor) otlpGauge(
 			continue
 		}
 
-		dest := p.nextMeasure(scope, metric, GaugeInstrument, dp.Attributes, dp.TimeUnixNano)
+		dest := p.nextMeasure(scope, metric, InstrumentGauge, dp.Attributes, dp.TimeUnixNano)
 		switch num := dp.Value.(type) {
 		case *metricspb.NumberDataPoint_AsInt:
 			dest.Value = float64(num.AsInt)
@@ -242,13 +254,13 @@ func (p *otlpProcessor) otlpSum(
 
 		if !data.Sum.IsMonotonic {
 			// Agg temporality does not matter.
-			dest.Instrument = AdditiveInstrument
+			dest.Instrument = InstrumentAdditive
 			dest.Value = toFloat64(dp.Value)
 			p.enqueue(dest)
 			continue
 		}
 
-		dest.Instrument = CounterInstrument
+		dest.Instrument = InstrumentCounter
 
 		if isDelta {
 			dest.Sum = toFloat64(dp.Value)
@@ -287,7 +299,7 @@ func (p *otlpProcessor) otlpHistogram(
 			continue
 		}
 
-		dest := p.nextMeasure(scope, metric, HistogramInstrument, dp.Attributes, dp.TimeUnixNano)
+		dest := p.nextMeasure(scope, metric, InstrumentHistogram, dp.Attributes, dp.TimeUnixNano)
 		if isDelta {
 			dest.Sum = dp.GetSum()
 			dest.Count = dp.Count
@@ -326,7 +338,7 @@ func (p *otlpProcessor) otlpExpHistogram(
 		buildBFloat16Hist(hist, base, int(dp.Positive.Offset), dp.Positive.BucketCounts, +1)
 		buildBFloat16Hist(hist, base, int(dp.Negative.Offset), dp.Negative.BucketCounts, -1)
 
-		dest := p.nextMeasure(scope, metric, HistogramInstrument, dp.Attributes, dp.TimeUnixNano)
+		dest := p.nextMeasure(scope, metric, InstrumentHistogram, dp.Attributes, dp.TimeUnixNano)
 		if isDelta {
 			dest.Sum = dp.GetSum()
 			dest.Count = dp.Count
@@ -368,7 +380,7 @@ func (p *otlpProcessor) otlpSummary(
 			continue
 		}
 
-		dest := p.nextMeasure(scope, metric, HistogramInstrument, dp.Attributes, dp.TimeUnixNano)
+		dest := p.nextMeasure(scope, metric, InstrumentHistogram, dp.Attributes, dp.TimeUnixNano)
 
 		dest.Sum = dp.Sum
 		dest.Count = dp.Count
@@ -389,7 +401,7 @@ func (p *otlpProcessor) otlpSummary(
 func (p *otlpProcessor) nextMeasure(
 	scope *commonpb.InstrumentationScope,
 	metric *metricspb.Metric,
-	instrument string,
+	instrument Instrument,
 	labels []*commonpb.KeyValue,
 	unixNano uint64,
 ) *Measure {

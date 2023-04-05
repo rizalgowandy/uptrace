@@ -13,15 +13,14 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	ua "github.com/mileusna/useragent"
+	"github.com/uptrace/uptrace/pkg/attrkey"
 	"github.com/uptrace/uptrace/pkg/bunapp"
-	"github.com/uptrace/uptrace/pkg/bunconf"
 	"github.com/uptrace/uptrace/pkg/bunotel"
 	"github.com/uptrace/uptrace/pkg/bunutil"
 	"github.com/uptrace/uptrace/pkg/logparser"
 	"github.com/uptrace/uptrace/pkg/org"
 	"github.com/uptrace/uptrace/pkg/otlpconv"
 	"github.com/uptrace/uptrace/pkg/sqlparser"
-	"github.com/uptrace/uptrace/pkg/tracing/attrkey"
 	"github.com/uptrace/uptrace/pkg/tracing/norm"
 	"github.com/uptrace/uptrace/pkg/utf8util"
 	"github.com/uptrace/uptrace/pkg/uuid"
@@ -33,7 +32,7 @@ type spanContext struct {
 	context.Context
 	*bunapp.App
 
-	projects map[uint32]*bunconf.Project
+	projects map[uint32]*org.Project
 	digest   *xxhash.Digest
 }
 
@@ -42,19 +41,19 @@ func newSpanContext(ctx context.Context, app *bunapp.App) *spanContext {
 		Context: ctx,
 		App:     app,
 
-		projects: make(map[uint32]*bunconf.Project),
+		projects: make(map[uint32]*org.Project),
 		digest:   xxhash.New(),
 	}
 }
 
-func (c *spanContext) Project(projectID uint32) (*bunconf.Project, bool) {
+func (c *spanContext) Project(projectID uint32) (*org.Project, bool) {
 	if p, ok := c.projects[projectID]; ok {
 		return p, true
 	}
 
 	project, err := org.SelectProject(c.Context, c.App, projectID)
 	if err != nil {
-		c.Zap(c.Context).Error("SelectProjectCached failed", zap.Error(err))
+		c.Zap(c.Context).Error("SelectProject failed", zap.Error(err))
 		return nil, false
 	}
 
@@ -75,9 +74,16 @@ func initSpanOrEvent(ctx *spanContext, span *Span) {
 		span.EventName = utf8util.TruncMedium(span.EventName)
 	} else {
 		assignSpanSystemAndGroupID(ctx, project, span)
-		span.Name = utf8util.TruncMedium(span.Name)
+
+		if name, _ := span.Attrs[attrkey.DisplayName].(string); name != "" {
+			span.Name = name
+			delete(span.Attrs, attrkey.DisplayName)
+		}
+
 		if span.Name == "" {
 			span.Name = "<empty>"
+		} else {
+			span.Name = utf8util.TruncMedium(span.Name)
 		}
 	}
 
@@ -455,7 +461,7 @@ func isSQLKeyword(s string) bool {
 	}
 }
 
-func assignSpanSystemAndGroupID(ctx *spanContext, project *bunconf.Project, span *Span) {
+func assignSpanSystemAndGroupID(ctx *spanContext, project *org.Project, span *Span) {
 	if s := span.Attrs.Text(attrkey.RPCSystem); s != "" {
 		span.Type = SpanTypeRPC
 		span.System = SpanTypeRPC + ":" + span.Attrs.ServiceNameOrUnknown()
@@ -476,7 +482,7 @@ func assignSpanSystemAndGroupID(ctx *spanContext, project *bunconf.Project, span
 			hashSpan(project, digest, span,
 				attrkey.MessagingSystem,
 				attrkey.MessagingOperation,
-				attrkey.MessagingDestination,
+				attrkey.MessagingDestinationName,
 				attrkey.MessagingDestinationKind,
 			)
 		})
@@ -539,7 +545,7 @@ func spanHash(digest *xxhash.Digest, fn func(digest *xxhash.Digest)) uint64 {
 	return digest.Sum64()
 }
 
-func hashSpan(project *bunconf.Project, digest *xxhash.Digest, span *Span, keys ...string) {
+func hashSpan(project *org.Project, digest *xxhash.Digest, span *Span, keys ...string) {
 	if project.GroupByEnv {
 		if env := span.Attrs.Text(attrkey.DeploymentEnvironment); env != "" {
 			digest.WriteString(env)
@@ -588,7 +594,7 @@ func initEvent(ctx *spanContext, span *Span) {
 	assignEventSystemAndGroupID(ctx, project, span)
 }
 
-func assignEventSystemAndGroupID(ctx *spanContext, project *bunconf.Project, span *Span) {
+func assignEventSystemAndGroupID(ctx *spanContext, project *org.Project, span *Span) {
 	switch span.EventName {
 	case otelEventLog:
 		sev, _ := span.Attrs[attrkey.LogSeverity].(string)
@@ -631,7 +637,7 @@ func assignEventSystemAndGroupID(ctx *spanContext, project *bunconf.Project, spa
 				attrkey.RPCSystem,
 				attrkey.RPCService,
 				attrkey.RPCMethod,
-				"message.type",
+				attrkey.MessageType,
 			)
 		})
 		span.EventName = spanMessageEventName(span)
